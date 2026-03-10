@@ -1,8 +1,10 @@
-use crate::models::{BoardColumn, IssuePlacement, IssueSnapshot, OutboxAction, PersistedState};
+use crate::models::{
+    BoardColumn, IssuePlacement, IssueSnapshot, JiraSettings, OutboxAction, PersistedState,
+};
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use directories::ProjectDirs;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::PathBuf;
 
 const APP_QUALIFIER: &str = "com";
@@ -204,6 +206,100 @@ impl AppStorage {
         Ok(())
     }
 
+    pub fn load_jira_settings(&self) -> Result<JiraSettings> {
+        let connection = self.connection()?;
+        let base_url = self.get_setting_value(&connection, "jira_base_url")?;
+        let email = self.get_setting_value(&connection, "jira_email")?;
+        let jql = self.get_setting_value(&connection, "jira_jql")?;
+
+        Ok(JiraSettings {
+            base_url: base_url.unwrap_or_default(),
+            email: email.unwrap_or_default(),
+            jql: jql.unwrap_or_default(),
+        })
+    }
+
+    pub fn save_jira_settings(&self, settings: &JiraSettings) -> Result<()> {
+        let connection = self.connection()?;
+        self.upsert_setting_value(
+            &connection,
+            "jira_base_url",
+            &settings.normalized_base_url(),
+        )?;
+        self.upsert_setting_value(&connection, "jira_email", &settings.normalized_email())?;
+        self.upsert_setting_value(&connection, "jira_jql", &settings.effective_jql())?;
+        Ok(())
+    }
+
+    pub fn upsert_issue_snapshots(&self, issues: &[IssueSnapshot]) -> Result<()> {
+        let mut connection = self.connection()?;
+        let tx = connection
+            .transaction()
+            .context("failed to start issue upsert transaction")?;
+
+        {
+            let mut statement = tx
+                .prepare(
+                    "
+                    INSERT INTO jira_issue_snapshot (issue_key, summary, assignee, jira_status, updated_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5)
+                    ON CONFLICT(issue_key)
+                    DO UPDATE SET
+                        summary = excluded.summary,
+                        assignee = excluded.assignee,
+                        jira_status = excluded.jira_status,
+                        updated_at = excluded.updated_at
+                    ",
+                )
+                .context("failed to prepare issue upsert statement")?;
+
+            for issue in issues {
+                statement
+                    .execute(params![
+                        issue.issue_key,
+                        issue.summary,
+                        issue.assignee,
+                        issue.jira_status,
+                        issue.updated_at,
+                    ])
+                    .with_context(|| format!("failed to upsert issue {}", issue.issue_key))?;
+            }
+        }
+
+        tx.commit()
+            .context("failed to commit issue upsert transaction")?;
+        Ok(())
+    }
+
+    fn get_setting_value(&self, connection: &Connection, key: &str) -> Result<Option<String>> {
+        let mut statement = connection
+            .prepare("SELECT value FROM settings WHERE key = ?1")
+            .with_context(|| format!("failed to prepare settings lookup for '{key}'"))?;
+
+        let value = statement
+            .query_row(params![key], |row| row.get::<_, String>(0))
+            .optional()
+            .with_context(|| format!("failed to read setting '{key}'"))?;
+
+        Ok(value)
+    }
+
+    fn upsert_setting_value(&self, connection: &Connection, key: &str, value: &str) -> Result<()> {
+        connection
+            .execute(
+                "
+                INSERT INTO settings (key, value)
+                VALUES (?1, ?2)
+                ON CONFLICT(key)
+                DO UPDATE SET value = excluded.value
+                ",
+                params![key, value],
+            )
+            .with_context(|| format!("failed to persist setting '{key}'"))?;
+
+        Ok(())
+    }
+
     fn bootstrap(&self) -> Result<()> {
         let connection = self.connection()?;
         connection.execute_batch(
@@ -244,11 +340,15 @@ impl AppStorage {
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(issue_key) REFERENCES jira_issue_snapshot(issue_key) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             ",
         )?;
 
         self.ensure_default_columns(&connection)?;
-        self.ensure_sample_issues(&connection)?;
 
         Ok(())
     }
@@ -272,49 +372,6 @@ impl AppStorage {
                 VALUES (?1, ?2, ?3)
                 ",
                 params![name, sort_order, now()],
-            )?;
-        }
-
-        Ok(())
-    }
-
-    fn ensure_sample_issues(&self, connection: &Connection) -> Result<()> {
-        let count: i64 =
-            connection.query_row("SELECT COUNT(1) FROM jira_issue_snapshot", [], |row| {
-                row.get(0)
-            })?;
-        if count > 0 {
-            return Ok(());
-        }
-
-        let sample_issues = [
-            (
-                "APP-101",
-                "Design first sync between Jira and local board",
-                "me",
-                "To Do",
-            ),
-            (
-                "APP-102",
-                "Add optional comment and transition modal",
-                "me",
-                "In Progress",
-            ),
-            (
-                "APP-103",
-                "Store custom columns and personal status locally",
-                "me",
-                "To Do",
-            ),
-        ];
-
-        for (issue_key, summary, assignee, jira_status) in sample_issues {
-            connection.execute(
-                "
-                INSERT INTO jira_issue_snapshot (issue_key, summary, assignee, jira_status, updated_at)
-                VALUES (?1, ?2, ?3, ?4, ?5)
-                ",
-                params![issue_key, summary, assignee, jira_status, now()],
             )?;
         }
 

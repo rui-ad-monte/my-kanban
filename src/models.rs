@@ -40,3 +40,42 @@ pub struct PersistedState {
     pub placements: Vec<IssuePlacement>,
     pub outbox_actions: Vec<OutboxAction>,
 }
+
+pub const DEFAULT_ASSIGNED_ISSUES_JQL: &str =
+    "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JiraSettings {
+    pub base_url: String,
+    pub email: String,
+    pub jql: String,
+}
+
+impl Default for JiraSettings {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            email: String::new(),
+            jql: DEFAULT_ASSIGNED_ISSUES_JQL.to_string(),
+        }
+    }
+}
+
+impl JiraSettings {
+    pub fn normalized_base_url(&self) -> String {
+        self.base_url.trim().trim_end_matches('/').to_string()
+    }
+
+    pub fn normalized_email(&self) -> String {
+        self.email.trim().to_string()
+    }
+
+    pub fn effective_jql(&self) -> String {
+        let clean = self.jql.trim();
+        if clean.is_empty() {
+            DEFAULT_ASSIGNED_ISSUES_JQL.to_string()
+        } else {
+            clean.to_string()
+        }
+    }
+}

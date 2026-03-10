@@ -1,7 +1,10 @@
+mod jira_client;
 mod models;
+mod secure_store;
 mod storage;
 
-use crate::models::{BoardColumn, IssuePlacement, IssueSnapshot};
+use crate::jira_client::{JiraClient, JiraCredentials};
+use crate::models::{BoardColumn, IssuePlacement, IssueSnapshot, JiraSettings};
 use crate::storage::AppStorage;
 use dioxus::prelude::*;
 use std::collections::HashMap;
@@ -56,6 +59,51 @@ body {
   font-size: 12px;
   letter-spacing: 0.4px;
   text-transform: uppercase;
+}
+
+.settings-panel {
+  margin-bottom: 14px;
+  border-radius: 16px;
+  border: 1px solid #d1d5db;
+  background: rgba(255, 255, 255, 0.9);
+  padding: 14px;
+  display: grid;
+  gap: 12px;
+}
+
+.settings-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.settings-header h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field label {
+  color: #4b5563;
+  font-size: 13px;
+}
+
+.settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .tabs {
@@ -281,6 +329,8 @@ struct UiState {
     columns: Vec<BoardColumn>,
     placements: HashMap<String, IssuePlacement>,
     outbox_pending_count: usize,
+    jira_settings: JiraSettings,
+    jira_token_saved: bool,
     notice: Option<String>,
     load_error: Option<String>,
 }
@@ -292,6 +342,10 @@ fn main() {
 #[allow(non_snake_case)]
 fn App() -> Element {
     let mut ui_state = use_signal(load_ui_state_safely);
+    let mut jira_base_url = use_signal(|| ui_state().jira_settings.base_url.clone());
+    let mut jira_email = use_signal(|| ui_state().jira_settings.email.clone());
+    let mut jira_jql = use_signal(|| ui_state().jira_settings.effective_jql());
+    let mut jira_api_token = use_signal(String::new);
     let mut section = use_signal(|| Section::Unmapped);
     let mut dragging_issue = use_signal(|| Option::<String>::None);
     let mut drop_dialog = use_signal(|| Option::<DropDialogState>::None);
@@ -310,6 +364,196 @@ fn App() -> Element {
                     p { "Desktop-first Dioxus starter with local board state" }
                 }
                 span { class: "badge", "Pending Jira updates: {snapshot.outbox_pending_count}" }
+            }
+
+            section { class: "settings-panel",
+                div { class: "settings-header",
+                    h2 { "Jira Connection" }
+                    span { class: "badge", if snapshot.jira_token_saved { "Token: saved" } else { "Token: missing" } }
+                }
+                div { class: "settings-grid",
+                    div { class: "field",
+                        label { "Base URL" }
+                        input {
+                            class: "text-input",
+                            r#type: "url",
+                            value: "{jira_base_url}",
+                            placeholder: "https://your-org.atlassian.net",
+                            oninput: move |event| jira_base_url.set(event.value()),
+                        }
+                    }
+                    div { class: "field",
+                        label { "Email" }
+                        input {
+                            class: "text-input",
+                            r#type: "email",
+                            value: "{jira_email}",
+                            placeholder: "you@company.com",
+                            oninput: move |event| jira_email.set(event.value()),
+                        }
+                    }
+                    div { class: "field",
+                        label { "API Token" }
+                        input {
+                            class: "text-input",
+                            r#type: "password",
+                            value: "{jira_api_token}",
+                            placeholder: "Paste new token to set/update",
+                            oninput: move |event| jira_api_token.set(event.value()),
+                        }
+                    }
+                }
+                div { class: "field",
+                    label { "Assigned issues JQL" }
+                    textarea {
+                        class: "textarea",
+                        value: "{jira_jql}",
+                        oninput: move |event| jira_jql.set(event.value()),
+                    }
+                }
+                div { class: "settings-actions",
+                    button {
+                        class: "button",
+                        onclick: move |_| {
+                            let settings = JiraSettings {
+                                base_url: jira_base_url(),
+                                email: jira_email(),
+                                jql: jira_jql(),
+                            };
+
+                            let token_to_store = jira_api_token().trim().to_string();
+                            let save_result = AppStorage::open().and_then(|storage| {
+                                storage.save_jira_settings(&settings)?;
+                                if !token_to_store.is_empty() {
+                                    secure_store::save_jira_api_token(&token_to_store)?;
+                                }
+                                Ok(())
+                            });
+
+                            match save_result {
+                                Ok(()) => {
+                                    jira_base_url.set(settings.normalized_base_url());
+                                    jira_email.set(settings.normalized_email());
+                                    jira_jql.set(settings.effective_jql());
+                                    jira_api_token.set(String::new());
+
+                                    let mut next = load_ui_state_safely();
+                                    next.notice = Some(
+                                        if token_to_store.is_empty() {
+                                            "Saved Jira settings.".to_string()
+                                        } else {
+                                            "Saved Jira settings and updated API token.".to_string()
+                                        },
+                                    );
+                                    ui_state.set(next);
+                                }
+                                Err(error) => {
+                                    let mut next = ui_state();
+                                    next.notice = Some(format!("Failed to save Jira settings: {error}"));
+                                    ui_state.set(next);
+                                }
+                            }
+                        },
+                        "Save Settings"
+                    }
+                    button {
+                        class: "button secondary",
+                        onclick: move |_| {
+                            let settings = JiraSettings {
+                                base_url: jira_base_url(),
+                                email: jira_email(),
+                                jql: jira_jql(),
+                            };
+
+                            let token_input = jira_api_token().trim().to_string();
+                            let mut ui_state_signal = ui_state;
+
+                            spawn(async move {
+                                let test_result = async {
+                                    let api_token = resolve_api_token(&token_input)?;
+                                    let credentials = JiraCredentials::from_settings(&settings, api_token)?;
+                                    let client = JiraClient::new(credentials)?;
+                                    client.test_connection().await
+                                }
+                                .await;
+
+                                match test_result {
+                                    Ok(display_name) => {
+                                        let mut next = ui_state_signal();
+                                        next.notice = Some(format!(
+                                            "Jira connection successful for {display_name}."
+                                        ));
+                                        ui_state_signal.set(next);
+                                    }
+                                    Err(error) => {
+                                        let mut next = ui_state_signal();
+                                        next.notice = Some(format!("Jira connection failed: {error}"));
+                                        ui_state_signal.set(next);
+                                    }
+                                }
+                            });
+                        },
+                        "Test Connection"
+                    }
+                    button {
+                        class: "button",
+                        onclick: move |_| {
+                            let settings = JiraSettings {
+                                base_url: jira_base_url(),
+                                email: jira_email(),
+                                jql: jira_jql(),
+                            };
+                            let token_to_store = jira_api_token().trim().to_string();
+
+                            let mut ui_state_signal = ui_state;
+                            let mut jira_base_url_signal = jira_base_url;
+                            let mut jira_email_signal = jira_email;
+                            let mut jira_jql_signal = jira_jql;
+                            let mut jira_api_token_signal = jira_api_token;
+
+                            spawn(async move {
+                                let sync_result = async {
+                                    let api_token = resolve_api_token(&token_to_store)?;
+                                    let credentials = JiraCredentials::from_settings(&settings, api_token)?;
+                                    let client = JiraClient::new(credentials)?;
+                                    let issues = client.fetch_assigned_issues(&settings.effective_jql()).await?;
+
+                                    let storage = AppStorage::open()?;
+                                    storage.save_jira_settings(&settings)?;
+                                    storage.upsert_issue_snapshots(&issues)?;
+
+                                    if !token_to_store.is_empty() {
+                                        secure_store::save_jira_api_token(&token_to_store)?;
+                                    }
+
+                                    Ok::<usize, anyhow::Error>(issues.len())
+                                }
+                                .await;
+
+                                match sync_result {
+                                    Ok(issue_count) => {
+                                        jira_base_url_signal.set(settings.normalized_base_url());
+                                        jira_email_signal.set(settings.normalized_email());
+                                        jira_jql_signal.set(settings.effective_jql());
+                                        jira_api_token_signal.set(String::new());
+
+                                        let mut next = load_ui_state_safely();
+                                        next.notice = Some(format!(
+                                            "Sync complete: fetched {issue_count} assigned issues from Jira."
+                                        ));
+                                        ui_state_signal.set(next);
+                                    }
+                                    Err(error) => {
+                                        let mut next = ui_state_signal();
+                                        next.notice = Some(format!("Sync failed: {error}"));
+                                        ui_state_signal.set(next);
+                                    }
+                                }
+                            });
+                        },
+                        "Sync Now"
+                    }
+                }
             }
 
             div { class: "tabs",
@@ -620,6 +864,19 @@ fn normalize_optional(value: &str) -> Option<String> {
     }
 }
 
+fn resolve_api_token(token_input: &str) -> anyhow::Result<String> {
+    let token = token_input.trim();
+    if !token.is_empty() {
+        return Ok(token.to_string());
+    }
+
+    secure_store::load_jira_api_token()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Jira API token is missing. Enter a token and click Save Settings, or paste one to use now."
+        )
+    })
+}
+
 fn load_ui_state_safely() -> UiState {
     match load_ui_state() {
         Ok(state) => state,
@@ -633,6 +890,13 @@ fn load_ui_state_safely() -> UiState {
 fn load_ui_state() -> anyhow::Result<UiState> {
     let storage = AppStorage::open()?;
     let persisted = storage.load_state()?;
+    let mut jira_settings = storage.load_jira_settings()?;
+    jira_settings.jql = jira_settings.effective_jql();
+
+    let jira_token_saved = match secure_store::load_jira_api_token() {
+        Ok(token) => token.is_some(),
+        Err(_) => false,
+    };
 
     let placements = persisted
         .placements
@@ -651,6 +915,8 @@ fn load_ui_state() -> anyhow::Result<UiState> {
         columns: persisted.columns,
         placements,
         outbox_pending_count,
+        jira_settings,
+        jira_token_saved,
         notice: None,
         load_error: None,
     })

@@ -19,11 +19,13 @@ Implemented:
 - Drop modal with optional transition and comment
 - SQLite local persistence (`jira_issue_snapshot`, `board_columns`, `issue_placements`, `outbox_actions`)
 - Local queue for future Jira sync worker
-- Seed data for first run
+- Jira connection panel (`base_url`, `email`, `api_token`, custom JQL)
+- Jira API token storage in system keychain
+- Connection test via Jira `/myself`
+- Manual assigned-issue sync via Jira `/search` with local upsert
 
 Not implemented yet:
 
-- Jira authentication and API integration
 - Live transition list from Jira per issue
 - Background outbox processor and retry policy
 - Conflict/sync status indicators in UI
@@ -102,11 +104,11 @@ Done when:
 
 ## Prioritized Next Steps (Immediate)
 
-1. Create `jira_client` module with auth + `myself` endpoint.
-2. Add settings screen for Jira credentials.
-3. Implement `Sync now` to populate local snapshots.
-4. Wire drop modal to fetch transitions dynamically from Jira.
-5. Implement first outbox processor with manual retry button.
+1. Wire drop modal to fetch transitions dynamically from Jira.
+2. Implement first outbox processor with manual retry button.
+3. Add retry/backoff policy and card-level sync status badges.
+4. Add stale issue handling (no longer assigned / moved to done).
+5. Add auto-refresh interval for incoming assigned-issue sync.
 
 ## Suggested Technical Structure
 
@@ -115,7 +117,7 @@ Done when:
 - `src/models.rs`: local domain models
 - `src/jira_client.rs`: Jira REST integration and DTOs
 - `src/sync.rs`: pull sync + outbox processing orchestration
-- `src/settings.rs`: secure settings/keychain helpers
+- `src/secure_store.rs`: keychain helpers for sensitive values
 
 ## Acceptance Criteria (MVP)
 
