@@ -1,12 +1,20 @@
 use crate::models::{IssueSnapshot, JiraSettings};
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use reqwest::header::ACCEPT;
 use reqwest::Client;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 const JIRA_API_PREFIX: &str = "/rest/api/3";
 const SEARCH_PAGE_SIZE: i64 = 100;
+const SEARCH_FIELDS: [&str; 4] = ["summary", "status", "assignee", "updated"];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JiraTransition {
+    pub id: String,
+    pub name: String,
+}
 
 #[derive(Clone, Debug)]
 pub struct JiraCredentials {
@@ -57,67 +65,123 @@ impl JiraClient {
     }
 
     pub async fn test_connection(&self) -> Result<String> {
-        let response = self
-            .http
-            .get(self.credentials.endpoint("/myself"))
-            .basic_auth(&self.credentials.email, Some(&self.credentials.api_token))
-            .header(ACCEPT, "application/json")
-            .send()
+        let myself = self
+            .execute_json::<MyselfResponse>(
+                self.http
+                    .get(self.credentials.endpoint("/myself"))
+                    .basic_auth(&self.credentials.email, Some(&self.credentials.api_token))
+                    .header(ACCEPT, "application/json"),
+                "/myself",
+            )
             .await
-            .context("failed to reach jira /myself endpoint")?
-            .error_for_status()
             .context("jira /myself request failed")?;
-
-        let myself = response
-            .json::<MyselfResponse>()
-            .await
-            .context("failed to parse jira /myself response")?;
 
         Ok(myself.display_name)
     }
 
     pub async fn fetch_assigned_issues(&self, jql: &str) -> Result<Vec<IssueSnapshot>> {
-        let mut start_at = 0_i64;
+        let mut next_page_token: Option<String> = None;
         let mut collected = Vec::new();
 
         loop {
             let request = SearchRequest {
-                jql,
-                start_at,
+                jql: jql.to_string(),
                 max_results: SEARCH_PAGE_SIZE,
-                fields: vec!["summary", "status", "assignee", "updated"],
+                fields: SEARCH_FIELDS.into_iter().map(str::to_string).collect(),
+                next_page_token: next_page_token.clone(),
             };
 
-            let response = self
-                .http
-                .post(self.credentials.endpoint("/search"))
-                .basic_auth(&self.credentials.email, Some(&self.credentials.api_token))
-                .header(ACCEPT, "application/json")
-                .header(CONTENT_TYPE, "application/json")
-                .json(&request)
-                .send()
+            let page = self
+                .execute_json::<SearchResponse>(
+                    self.http
+                        .post(self.credentials.endpoint("/search/jql"))
+                        .basic_auth(&self.credentials.email, Some(&self.credentials.api_token))
+                        .header(ACCEPT, "application/json")
+                        .json(&request),
+                    "/search/jql",
+                )
                 .await
-                .context("failed to reach jira /search endpoint")?
-                .error_for_status()
-                .context("jira /search request failed")?;
-
-            let page = response
-                .json::<SearchResponse>()
-                .await
-                .context("failed to parse jira /search response")?;
+                .context("jira /search/jql request failed")?;
 
             let page_size = page.issues.len();
             collected.extend(page.issues.into_iter().map(map_issue_snapshot));
 
-            let processed_count = start_at + page.max_results;
-            if processed_count >= page.total || page_size == 0 {
+            if page_size == 0 {
                 break;
             }
 
-            start_at += page.max_results;
+            if let Some(token) = page.next_page_token {
+                if token.trim().is_empty() {
+                    break;
+                }
+                next_page_token = Some(token);
+                continue;
+            }
+
+            if let Some(is_last) = page.is_last {
+                if is_last || page_size == 0 {
+                    break;
+                }
+            }
+
+            break;
         }
 
         Ok(collected)
+    }
+
+    pub async fn fetch_issue_transitions(&self, issue_key: &str) -> Result<Vec<JiraTransition>> {
+        let transitions = self
+            .execute_json::<TransitionsResponse>(
+                self.http
+                    .get(
+                        self.credentials
+                            .endpoint(&format!("/issue/{issue_key}/transitions")),
+                    )
+                    .basic_auth(&self.credentials.email, Some(&self.credentials.api_token))
+                    .header(ACCEPT, "application/json"),
+                &format!("/issue/{issue_key}/transitions"),
+            )
+            .await
+            .with_context(|| format!("jira transitions request failed for {issue_key}"))?;
+
+        Ok(transitions
+            .transitions
+            .into_iter()
+            .map(|transition| JiraTransition {
+                id: transition.id,
+                name: transition.name,
+            })
+            .collect())
+    }
+
+    async fn execute_json<T: DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        operation: &str,
+    ) -> Result<T> {
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("failed to reach jira {operation} endpoint"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unable to read response body>".to_string());
+            return Err(anyhow!(
+                "jira {operation} request failed (HTTP {}): {}",
+                status.as_u16(),
+                compact_error_body(&body)
+            ));
+        }
+
+        response
+            .json::<T>()
+            .await
+            .with_context(|| format!("failed to parse jira {operation} response"))
     }
 }
 
@@ -128,20 +192,23 @@ struct MyselfResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct SearchRequest<'a> {
-    jql: &'a str,
-    #[serde(rename = "startAt")]
-    start_at: i64,
+struct SearchRequest {
+    jql: String,
     #[serde(rename = "maxResults")]
     max_results: i64,
-    fields: Vec<&'a str>,
+    fields: Vec<String>,
+    #[serde(rename = "nextPageToken")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_page_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SearchResponse {
-    total: i64,
-    #[serde(rename = "maxResults")]
-    max_results: i64,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
+    #[serde(rename = "isLast")]
+    is_last: Option<bool>,
+    #[serde(default)]
     issues: Vec<SearchIssue>,
 }
 
@@ -170,6 +237,17 @@ struct SearchIssueAssignee {
     display_name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct TransitionsResponse {
+    transitions: Vec<TransitionItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TransitionItem {
+    id: String,
+    name: String,
+}
+
 fn map_issue_snapshot(issue: SearchIssue) -> IssueSnapshot {
     IssueSnapshot {
         issue_key: issue.key,
@@ -191,5 +269,19 @@ fn map_issue_snapshot(issue: SearchIssue) -> IssueSnapshot {
             .fields
             .updated
             .unwrap_or_else(|| Utc::now().to_rfc3339()),
+    }
+}
+
+fn compact_error_body(body: &str) -> String {
+    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return "<empty response body>".to_string();
+    }
+
+    const MAX_LEN: usize = 280;
+    if compact.len() <= MAX_LEN {
+        compact
+    } else {
+        format!("{}...", &compact[..MAX_LEN])
     }
 }

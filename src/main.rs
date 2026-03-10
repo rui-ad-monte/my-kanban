@@ -1,9 +1,9 @@
+mod app_log;
 mod jira_client;
 mod models;
-mod secure_store;
 mod storage;
 
-use crate::jira_client::{JiraClient, JiraCredentials};
+use crate::jira_client::{JiraClient, JiraCredentials, JiraTransition};
 use crate::models::{BoardColumn, IssuePlacement, IssueSnapshot, JiraSettings};
 use crate::storage::AppStorage;
 use dioxus::prelude::*;
@@ -319,7 +319,10 @@ enum Section {
 struct DropDialogState {
     issue_key: String,
     target_column_id: i64,
-    transition_to: String,
+    selected_transition_id: String,
+    transitions: Vec<JiraTransition>,
+    transitions_loading: bool,
+    transitions_error: Option<String>,
     comment: String,
 }
 
@@ -336,7 +339,15 @@ struct UiState {
 }
 
 fn main() {
-    dioxus::launch(App);
+    LaunchBuilder::new()
+        .with_cfg(
+            dioxus::desktop::Config::new().with_window(
+                dioxus::desktop::WindowBuilder::new()
+                    .with_title("Personal Jira Layer")
+                    .with_always_on_top(false),
+            ),
+        )
+        .launch(App);
 }
 
 #[allow(non_snake_case)]
@@ -424,9 +435,7 @@ fn App() -> Element {
                             let token_to_store = jira_api_token().trim().to_string();
                             let save_result = AppStorage::open().and_then(|storage| {
                                 storage.save_jira_settings(&settings)?;
-                                if !token_to_store.is_empty() {
-                                    secure_store::save_jira_api_token(&token_to_store)?;
-                                }
+                                persist_api_token_if_provided(&token_to_store)?;
                                 Ok(())
                             });
 
@@ -435,12 +444,11 @@ fn App() -> Element {
                                     jira_base_url.set(settings.normalized_base_url());
                                     jira_email.set(settings.normalized_email());
                                     jira_jql.set(settings.effective_jql());
-                                    jira_api_token.set(String::new());
 
                                     let mut next = load_ui_state_safely();
                                     next.notice = Some(
                                         if token_to_store.is_empty() {
-                                            "Saved Jira settings.".to_string()
+                                            "Saved Jira settings. API token unchanged.".to_string()
                                         } else {
                                             "Saved Jira settings and updated API token.".to_string()
                                         },
@@ -449,7 +457,10 @@ fn App() -> Element {
                                 }
                                 Err(error) => {
                                     let mut next = ui_state();
-                                    next.notice = Some(format!("Failed to save Jira settings: {error}"));
+                                    next.notice = Some(format!(
+                                        "Failed to save Jira settings: {}",
+                                        format_error_with_log("save_settings", &error)
+                                    ));
                                     ui_state.set(next);
                                 }
                             }
@@ -487,7 +498,10 @@ fn App() -> Element {
                                     }
                                     Err(error) => {
                                         let mut next = ui_state_signal();
-                                        next.notice = Some(format!("Jira connection failed: {error}"));
+                                        next.notice = Some(format!(
+                                            "Jira connection failed: {}",
+                                            format_error_with_log("test_connection", &error)
+                                        ));
                                         ui_state_signal.set(next);
                                     }
                                 }
@@ -509,7 +523,6 @@ fn App() -> Element {
                             let mut jira_base_url_signal = jira_base_url;
                             let mut jira_email_signal = jira_email;
                             let mut jira_jql_signal = jira_jql;
-                            let mut jira_api_token_signal = jira_api_token;
 
                             spawn(async move {
                                 let sync_result = async {
@@ -522,10 +535,6 @@ fn App() -> Element {
                                     storage.save_jira_settings(&settings)?;
                                     storage.upsert_issue_snapshots(&issues)?;
 
-                                    if !token_to_store.is_empty() {
-                                        secure_store::save_jira_api_token(&token_to_store)?;
-                                    }
-
                                     Ok::<usize, anyhow::Error>(issues.len())
                                 }
                                 .await;
@@ -535,7 +544,6 @@ fn App() -> Element {
                                         jira_base_url_signal.set(settings.normalized_base_url());
                                         jira_email_signal.set(settings.normalized_email());
                                         jira_jql_signal.set(settings.effective_jql());
-                                        jira_api_token_signal.set(String::new());
 
                                         let mut next = load_ui_state_safely();
                                         next.notice = Some(format!(
@@ -545,7 +553,10 @@ fn App() -> Element {
                                     }
                                     Err(error) => {
                                         let mut next = ui_state_signal();
-                                        next.notice = Some(format!("Sync failed: {error}"));
+                                        next.notice = Some(format!(
+                                            "Sync failed: {}",
+                                            format_error_with_log("sync_now", &error)
+                                        ));
                                         ui_state_signal.set(next);
                                     }
                                 }
@@ -672,13 +683,72 @@ fn App() -> Element {
                                         ondrop: move |event| {
                                             event.prevent_default();
                                             if let Some(issue_key) = dragging_issue() {
+                                                let settings = JiraSettings {
+                                                    base_url: jira_base_url(),
+                                                    email: jira_email(),
+                                                    jql: jira_jql(),
+                                                };
+                                                let token_input = jira_api_token().trim().to_string();
+
                                                 drop_dialog.set(Some(DropDialogState {
-                                                    issue_key,
+                                                    issue_key: issue_key.clone(),
                                                     target_column_id: column_id,
-                                                    transition_to: String::new(),
+                                                    selected_transition_id: String::new(),
+                                                    transitions: Vec::new(),
+                                                    transitions_loading: true,
+                                                    transitions_error: None,
                                                     comment: String::new(),
                                                 }));
                                                 dragging_issue.set(None);
+
+                                                let issue_key_for_fetch = issue_key;
+                                                let mut drop_dialog_signal = drop_dialog;
+
+                                                spawn(async move {
+                                                    let transitions_result = async {
+                                                        let api_token = resolve_api_token(&token_input)?;
+                                                        let credentials = JiraCredentials::from_settings(&settings, api_token)?;
+                                                        let client = JiraClient::new(credentials)?;
+                                                        client.fetch_issue_transitions(&issue_key_for_fetch).await
+                                                    }
+                                                    .await;
+
+                                                    let Some(mut current_dialog) = drop_dialog_signal() else {
+                                                        return;
+                                                    };
+
+                                                    if current_dialog.issue_key != issue_key_for_fetch {
+                                                        return;
+                                                    }
+
+                                                    current_dialog.transitions_loading = false;
+
+                                                    match transitions_result {
+                                                        Ok(transitions) => {
+                                                            if !transitions.iter().any(|transition| {
+                                                                transition.id
+                                                                    == current_dialog.selected_transition_id
+                                                            }) {
+                                                                current_dialog.selected_transition_id =
+                                                                    String::new();
+                                                            }
+                                                            current_dialog.transitions = transitions;
+                                                            current_dialog.transitions_error = None;
+                                                        }
+                                                        Err(error) => {
+                                                            current_dialog.transitions = Vec::new();
+                                                            let details = format_error_with_log(
+                                                                "load_transitions",
+                                                                &error,
+                                                            );
+                                                            current_dialog.transitions_error = Some(format!(
+                                                                "Could not load transitions from Jira: {details}"
+                                                            ));
+                                                        }
+                                                    }
+
+                                                    drop_dialog_signal.set(Some(current_dialog));
+                                                });
                                             }
                                         },
                                         h3 { "{column.name} ({issue_count})" }
@@ -712,20 +782,35 @@ fn App() -> Element {
                             h3 { "Finalize move" }
                             p { "Issue {dialog.issue_key} moved to {target_column_name}" }
                             label { class: "label", "Jira transition (optional)" }
+                            if dialog.transitions_loading {
+                                p { class: "drop-hint", "Loading transitions from Jira..." }
+                            }
+                            {
+                                dialog
+                                    .transitions_error
+                                    .clone()
+                                    .map(|error| rsx! { p { class: "error", "{error}" } })
+                            }
                             select {
                                 class: "select",
-                                value: "{dialog.transition_to}",
+                                value: "{dialog.selected_transition_id}",
                                 onchange: move |event| {
                                     if let Some(mut current) = drop_dialog() {
-                                        current.transition_to = event.value();
+                                        current.selected_transition_id = event.value();
                                         drop_dialog.set(Some(current));
                                     }
                                 },
                                 option { value: "", "No Jira transition" }
-                                option { value: "To Do", "To Do" }
-                                option { value: "In Progress", "In Progress" }
-                                option { value: "In Review", "In Review" }
-                                option { value: "Done", "Done" }
+                                for transition in dialog.transitions.clone() {
+                                    option {
+                                        key: "{transition.id}",
+                                        value: "{transition.id}",
+                                        "{transition.name}"
+                                    }
+                                }
+                            }
+                            if !dialog.transitions_loading && dialog.transitions.is_empty() && dialog.transitions_error.is_none() {
+                                p { class: "drop-hint", "No available transitions for this issue." }
                             }
                             label { class: "label", "Comment (optional)" }
                             textarea {
@@ -752,7 +837,14 @@ fn App() -> Element {
                                             return;
                                         };
 
-                                        let transition_to = normalize_optional(&current.transition_to);
+                                        let transition_id = normalize_optional(&current.selected_transition_id);
+                                        let transition_name = transition_id.as_ref().and_then(|selected_id| {
+                                            current
+                                                .transitions
+                                                .iter()
+                                                .find(|transition| transition.id == *selected_id)
+                                                .map(|transition| transition.name.clone())
+                                        });
                                         let comment = normalize_optional(&current.comment);
                                         let rank = next_rank_for_column(&ui_state(), current.target_column_id);
 
@@ -760,7 +852,8 @@ fn App() -> Element {
                                             storage.move_issue(&current.issue_key, current.target_column_id, rank)?;
                                             storage.queue_jira_update(
                                                 &current.issue_key,
-                                                transition_to.as_deref(),
+                                                transition_id.as_deref(),
+                                                transition_name.as_deref(),
                                                 comment.as_deref(),
                                             )?;
                                             Ok(())
@@ -769,7 +862,7 @@ fn App() -> Element {
                                         match save_result {
                                             Ok(()) => {
                                                 let mut next = load_ui_state_safely();
-                                                next.notice = Some(match (transition_to.is_some(), comment.is_some()) {
+                                                next.notice = Some(match (transition_id.is_some(), comment.is_some()) {
                                                     (false, false) => "Move saved locally.".to_string(),
                                                     _ => "Move saved locally and Jira update queued.".to_string(),
                                                 });
@@ -867,23 +960,46 @@ fn normalize_optional(value: &str) -> Option<String> {
 fn resolve_api_token(token_input: &str) -> anyhow::Result<String> {
     let token = token_input.trim();
     if !token.is_empty() {
+        persist_api_token_if_provided(token)?;
         return Ok(token.to_string());
     }
 
-    secure_store::load_jira_api_token()?.ok_or_else(|| {
+    AppStorage::open()?.load_jira_api_token()?.ok_or_else(|| {
         anyhow::anyhow!(
             "Jira API token is missing. Enter a token and click Save Settings, or paste one to use now."
         )
     })
 }
 
+fn persist_api_token_if_provided(token_input: &str) -> anyhow::Result<()> {
+    let token = token_input.trim();
+    if token.is_empty() {
+        return Ok(());
+    }
+
+    AppStorage::open()?.save_jira_api_token(token)?;
+    Ok(())
+}
+
+fn format_error_with_log(scope: &str, error: &anyhow::Error) -> String {
+    let details = format!("{error:#}");
+
+    match app_log::append_error(scope, &details) {
+        Ok(path) => format!("{details} (log: {})", path.display()),
+        Err(log_error) => format!("{details} (also failed to write log: {log_error:#})"),
+    }
+}
+
 fn load_ui_state_safely() -> UiState {
     match load_ui_state() {
         Ok(state) => state,
-        Err(error) => UiState {
-            load_error: Some(format!("Failed to load local data: {error}")),
-            ..UiState::default()
-        },
+        Err(error) => {
+            let details = format_error_with_log("load_ui_state", &error);
+            UiState {
+                load_error: Some(format!("Failed to load local data: {details}")),
+                ..UiState::default()
+            }
+        }
     }
 }
 
@@ -893,7 +1009,7 @@ fn load_ui_state() -> anyhow::Result<UiState> {
     let mut jira_settings = storage.load_jira_settings()?;
     jira_settings.jql = jira_settings.effective_jql();
 
-    let jira_token_saved = match secure_store::load_jira_api_token() {
+    let jira_token_saved = match storage.load_jira_api_token() {
         Ok(token) => token.is_some(),
         Err(_) => false,
     };

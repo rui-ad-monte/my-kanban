@@ -20,13 +20,14 @@ Implemented:
 - SQLite local persistence (`jira_issue_snapshot`, `board_columns`, `issue_placements`, `outbox_actions`)
 - Local queue for future Jira sync worker
 - Jira connection panel (`base_url`, `email`, `api_token`, custom JQL)
-- Jira API token storage in system keychain
+- Jira API token storage in local SQLite settings
 - Connection test via Jira `/myself`
-- Manual assigned-issue sync via Jira `/search` with local upsert
+- Manual assigned-issue sync via Jira `/search/jql` with local upsert
+- Drop modal transition options fetched live from Jira per issue
+- Outbox queue stores transition id + name for future worker execution
 
 Not implemented yet:
 
-- Live transition list from Jira per issue
 - Background outbox processor and retry policy
 - Conflict/sync status indicators in UI
 
@@ -38,7 +39,7 @@ Not implemented yet:
    - Jira base URL
    - Jira email
    - Jira API token
-2. Store secrets securely (system keychain), not plain SQLite.
+2. Persist Jira API token locally in settings for quick reuse.
 3. Add `jira_client` module with typed API functions:
    - `myself`
    - `search_assigned_issues`
@@ -104,11 +105,11 @@ Done when:
 
 ## Prioritized Next Steps (Immediate)
 
-1. Wire drop modal to fetch transitions dynamically from Jira.
-2. Implement first outbox processor with manual retry button.
-3. Add retry/backoff policy and card-level sync status badges.
-4. Add stale issue handling (no longer assigned / moved to done).
-5. Add auto-refresh interval for incoming assigned-issue sync.
+1. Implement first outbox processor with manual retry button.
+2. Add retry/backoff policy and card-level sync status badges.
+3. Add stale issue handling (no longer assigned / moved to done).
+4. Add auto-refresh interval for incoming assigned-issue sync.
+5. Add conflict indicators for local-vs-jira status mismatches.
 
 ## Suggested Technical Structure
 
@@ -117,7 +118,6 @@ Done when:
 - `src/models.rs`: local domain models
 - `src/jira_client.rs`: Jira REST integration and DTOs
 - `src/sync.rs`: pull sync + outbox processing orchestration
-- `src/secure_store.rs`: keychain helpers for sensitive values
 
 ## Acceptance Criteria (MVP)
 

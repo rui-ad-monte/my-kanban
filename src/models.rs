@@ -26,7 +26,8 @@ pub struct IssuePlacement {
 pub struct OutboxAction {
     pub id: i64,
     pub issue_key: String,
-    pub transition_to: Option<String>,
+    pub transition_id: Option<String>,
+    pub transition_name: Option<String>,
     pub comment: Option<String>,
     pub state: String,
     pub last_error: Option<String>,

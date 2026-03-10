@@ -5,6 +5,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use directories::ProjectDirs;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 const APP_QUALIFIER: &str = "com";
@@ -96,7 +97,15 @@ impl AppStorage {
         let outbox_actions = {
             let mut stmt = connection.prepare(
                 "
-                SELECT id, issue_key, transition_to, comment, state, last_error, created_at
+                SELECT
+                    id,
+                    issue_key,
+                    transition_id,
+                    COALESCE(transition_name, transition_to),
+                    comment,
+                    state,
+                    last_error,
+                    created_at
                 FROM outbox_actions
                 ORDER BY id DESC
                 ",
@@ -106,11 +115,12 @@ impl AppStorage {
                 Ok(OutboxAction {
                     id: row.get(0)?,
                     issue_key: row.get(1)?,
-                    transition_to: row.get(2)?,
-                    comment: row.get(3)?,
-                    state: row.get(4)?,
-                    last_error: row.get(5)?,
-                    created_at: row.get(6)?,
+                    transition_id: row.get(2)?,
+                    transition_name: row.get(3)?,
+                    comment: row.get(4)?,
+                    state: row.get(5)?,
+                    last_error: row.get(6)?,
+                    created_at: row.get(7)?,
                 })
             })?;
 
@@ -185,10 +195,11 @@ impl AppStorage {
     pub fn queue_jira_update(
         &self,
         issue_key: &str,
-        transition_to: Option<&str>,
+        transition_id: Option<&str>,
+        transition_name: Option<&str>,
         comment: Option<&str>,
     ) -> Result<()> {
-        if transition_to.is_none() && comment.is_none() {
+        if transition_id.is_none() && comment.is_none() {
             return Ok(());
         }
 
@@ -196,10 +207,26 @@ impl AppStorage {
         connection
             .execute(
                 "
-                INSERT INTO outbox_actions (issue_key, transition_to, comment, state, last_error, created_at)
-                VALUES (?1, ?2, ?3, 'pending', NULL, ?4)
+                INSERT INTO outbox_actions (
+                    issue_key,
+                    transition_to,
+                    transition_id,
+                    transition_name,
+                    comment,
+                    state,
+                    last_error,
+                    created_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, 'pending', NULL, ?6)
                 ",
-                params![issue_key, transition_to, comment, now()],
+                params![
+                    issue_key,
+                    transition_name,
+                    transition_id,
+                    transition_name,
+                    comment,
+                    now()
+                ],
             )
             .context("failed to queue jira update")?;
 
@@ -229,6 +256,21 @@ impl AppStorage {
         self.upsert_setting_value(&connection, "jira_email", &settings.normalized_email())?;
         self.upsert_setting_value(&connection, "jira_jql", &settings.effective_jql())?;
         Ok(())
+    }
+
+    pub fn load_jira_api_token(&self) -> Result<Option<String>> {
+        let connection = self.connection()?;
+        self.get_setting_value(&connection, "jira_api_token")
+    }
+
+    pub fn save_jira_api_token(&self, token: &str) -> Result<()> {
+        let clean_token = token.trim();
+        if clean_token.is_empty() {
+            return Ok(());
+        }
+
+        let connection = self.connection()?;
+        self.upsert_setting_value(&connection, "jira_api_token", clean_token)
     }
 
     pub fn upsert_issue_snapshots(&self, issues: &[IssueSnapshot]) -> Result<()> {
@@ -334,6 +376,8 @@ impl AppStorage {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 issue_key TEXT NOT NULL,
                 transition_to TEXT,
+                transition_id TEXT,
+                transition_name TEXT,
                 comment TEXT,
                 state TEXT NOT NULL,
                 last_error TEXT,
@@ -348,7 +392,58 @@ impl AppStorage {
             ",
         )?;
 
+        self.ensure_outbox_action_columns(&connection)?;
+
         self.ensure_default_columns(&connection)?;
+
+        Ok(())
+    }
+
+    fn ensure_outbox_action_columns(&self, connection: &Connection) -> Result<()> {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(outbox_actions)")
+            .context("failed to inspect outbox_actions schema")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+
+        if !columns.contains("transition_to") {
+            connection
+                .execute(
+                    "ALTER TABLE outbox_actions ADD COLUMN transition_to TEXT",
+                    [],
+                )
+                .context("failed to add outbox_actions.transition_to")?;
+        }
+
+        if !columns.contains("transition_id") {
+            connection
+                .execute(
+                    "ALTER TABLE outbox_actions ADD COLUMN transition_id TEXT",
+                    [],
+                )
+                .context("failed to add outbox_actions.transition_id")?;
+        }
+
+        if !columns.contains("transition_name") {
+            connection
+                .execute(
+                    "ALTER TABLE outbox_actions ADD COLUMN transition_name TEXT",
+                    [],
+                )
+                .context("failed to add outbox_actions.transition_name")?;
+        }
+
+        connection
+            .execute(
+                "
+                UPDATE outbox_actions
+                SET transition_name = COALESCE(transition_name, transition_to)
+                WHERE transition_to IS NOT NULL
+                ",
+                [],
+            )
+            .context("failed to migrate legacy outbox transition names")?;
 
         Ok(())
     }
