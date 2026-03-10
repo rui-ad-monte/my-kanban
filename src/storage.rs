@@ -111,18 +111,7 @@ impl AppStorage {
                 ",
             )?;
 
-            let rows = stmt.query_map([], |row| {
-                Ok(OutboxAction {
-                    id: row.get(0)?,
-                    issue_key: row.get(1)?,
-                    transition_id: row.get(2)?,
-                    transition_name: row.get(3)?,
-                    comment: row.get(4)?,
-                    state: row.get(5)?,
-                    last_error: row.get(6)?,
-                    created_at: row.get(7)?,
-                })
-            })?;
+            let rows = stmt.query_map([], map_outbox_action_row)?;
 
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
@@ -233,6 +222,108 @@ impl AppStorage {
         Ok(())
     }
 
+    pub fn load_processable_outbox_actions(&self, limit: usize) -> Result<Vec<OutboxAction>> {
+        let safe_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "
+            SELECT
+                id,
+                issue_key,
+                transition_id,
+                COALESCE(transition_name, transition_to),
+                comment,
+                state,
+                last_error,
+                created_at
+            FROM outbox_actions
+            WHERE state IN ('pending', 'failed', 'processing')
+            ORDER BY id ASC
+            LIMIT ?1
+            ",
+        )?;
+
+        let rows = statement.query_map(params![safe_limit], map_outbox_action_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn mark_outbox_action_processing(&self, action_id: i64) -> Result<()> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "
+                UPDATE outbox_actions
+                SET state = 'processing', last_error = NULL
+                WHERE id = ?1
+                ",
+                params![action_id],
+            )
+            .with_context(|| format!("failed to mark outbox action {action_id} as processing"))?;
+        Ok(())
+    }
+
+    pub fn clear_outbox_transition(&self, action_id: i64) -> Result<()> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "
+                UPDATE outbox_actions
+                SET transition_to = NULL, transition_id = NULL, transition_name = NULL
+                WHERE id = ?1
+                ",
+                params![action_id],
+            )
+            .with_context(|| {
+                format!("failed to clear transition payload for action {action_id}")
+            })?;
+        Ok(())
+    }
+
+    pub fn clear_outbox_comment(&self, action_id: i64) -> Result<()> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "
+                UPDATE outbox_actions
+                SET comment = NULL
+                WHERE id = ?1
+                ",
+                params![action_id],
+            )
+            .with_context(|| format!("failed to clear comment payload for action {action_id}"))?;
+        Ok(())
+    }
+
+    pub fn mark_outbox_action_done(&self, action_id: i64) -> Result<()> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "
+                UPDATE outbox_actions
+                SET state = 'done', last_error = NULL
+                WHERE id = ?1
+                ",
+                params![action_id],
+            )
+            .with_context(|| format!("failed to mark outbox action {action_id} as done"))?;
+        Ok(())
+    }
+
+    pub fn mark_outbox_action_failed(&self, action_id: i64, error: &str) -> Result<()> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "
+                UPDATE outbox_actions
+                SET state = 'failed', last_error = ?2
+                WHERE id = ?1
+                ",
+                params![action_id, error],
+            )
+            .with_context(|| format!("failed to mark outbox action {action_id} as failed"))?;
+        Ok(())
+    }
+
     pub fn load_jira_settings(&self) -> Result<JiraSettings> {
         let connection = self.connection()?;
         let base_url = self.get_setting_value(&connection, "jira_base_url")?;
@@ -271,6 +362,19 @@ impl AppStorage {
 
         let connection = self.connection()?;
         self.upsert_setting_value(&connection, "jira_api_token", clean_token)
+    }
+
+    pub fn count_outbox_actions_by_state(&self, state: &str) -> Result<usize> {
+        let connection = self.connection()?;
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(1) FROM outbox_actions WHERE state = ?1",
+                params![state],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("failed to count outbox actions in state '{state}'"))?;
+
+        Ok(usize::try_from(count).unwrap_or(0))
     }
 
     pub fn upsert_issue_snapshots(&self, issues: &[IssueSnapshot]) -> Result<()> {
@@ -480,4 +584,17 @@ impl AppStorage {
 
 fn now() -> String {
     Utc::now().to_rfc3339()
+}
+
+fn map_outbox_action_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxAction> {
+    Ok(OutboxAction {
+        id: row.get(0)?,
+        issue_key: row.get(1)?,
+        transition_id: row.get(2)?,
+        transition_name: row.get(3)?,
+        comment: row.get(4)?,
+        state: row.get(5)?,
+        last_error: row.get(6)?,
+        created_at: row.get(7)?,
+    })
 }

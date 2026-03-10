@@ -2,10 +2,12 @@ mod app_log;
 mod jira_client;
 mod models;
 mod storage;
+mod sync;
 
 use crate::jira_client::{JiraClient, JiraCredentials, JiraTransition};
 use crate::models::{BoardColumn, IssuePlacement, IssueSnapshot, JiraSettings};
 use crate::storage::AppStorage;
+use crate::sync::process_outbox_once;
 use dioxus::prelude::*;
 use std::collections::HashMap;
 
@@ -183,6 +185,11 @@ body {
   cursor: grabbing;
 }
 
+.issue-card.selectable,
+.issue-card.selectable:active {
+  cursor: pointer;
+}
+
 .issue-header {
   display: flex;
   justify-content: space-between;
@@ -202,6 +209,22 @@ body {
   color: #78350f;
   padding: 4px 8px;
   font-size: 12px;
+}
+
+.sync-chip {
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.sync-chip.pending {
+  background: #e0f2fe;
+  color: #075985;
+}
+
+.sync-chip.failed {
+  background: #fee2e2;
+  color: #991b1b;
 }
 
 .column-creator {
@@ -326,12 +349,26 @@ struct DropDialogState {
     comment: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MapDialogState {
+    issue_key: String,
+    selected_column_id: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IssueSyncState {
+    Pending,
+    Failed,
+}
+
 #[derive(Clone, Debug, Default)]
 struct UiState {
     issues: Vec<IssueSnapshot>,
     columns: Vec<BoardColumn>,
     placements: HashMap<String, IssuePlacement>,
     outbox_pending_count: usize,
+    outbox_failed_count: usize,
+    issue_sync_states: HashMap<String, IssueSyncState>,
     jira_settings: JiraSettings,
     jira_token_saved: bool,
     notice: Option<String>,
@@ -360,11 +397,14 @@ fn App() -> Element {
     let mut section = use_signal(|| Section::Unmapped);
     let mut dragging_issue = use_signal(|| Option::<String>::None);
     let mut drop_dialog = use_signal(|| Option::<DropDialogState>::None);
+    let mut map_dialog = use_signal(|| Option::<MapDialogState>::None);
     let mut new_column_name = use_signal(String::new);
 
     let snapshot = ui_state();
-    let unmapped = unmapped_issues(&snapshot);
+    let unmapped_issues_list = unmapped_issues(&snapshot);
     let drop_dialog_snapshot = drop_dialog();
+    let map_dialog_snapshot = map_dialog();
+    let default_column_id = snapshot.columns.first().map(|column| column.id);
 
     rsx! {
         style { "{APP_STYLE}" }
@@ -374,7 +414,7 @@ fn App() -> Element {
                     h1 { "Personal Jira Layer" }
                     p { "Desktop-first Dioxus starter with local board state" }
                 }
-                span { class: "badge", "Pending Jira updates: {snapshot.outbox_pending_count}" }
+                span { class: "badge", "Queue pending: {snapshot.outbox_pending_count} | failed: {snapshot.outbox_failed_count}" }
             }
 
             section { class: "settings-panel",
@@ -564,6 +604,54 @@ fn App() -> Element {
                         },
                         "Sync Now"
                     }
+                    button {
+                        class: "button secondary",
+                        onclick: move |_| {
+                            let settings = JiraSettings {
+                                base_url: jira_base_url(),
+                                email: jira_email(),
+                                jql: jira_jql(),
+                            };
+                            let token_to_store = jira_api_token().trim().to_string();
+                            let mut ui_state_signal = ui_state;
+
+                            spawn(async move {
+                                let queue_result = async {
+                                    let api_token = resolve_api_token(&token_to_store)?;
+                                    let storage = AppStorage::open()?;
+                                    storage.save_jira_settings(&settings)?;
+                                    storage.save_jira_api_token(&token_to_store)?;
+
+                                    process_outbox_once(settings, api_token, 50).await
+                                }
+                                .await;
+
+                                match queue_result {
+                                    Ok(summary) => {
+                                        let mut next = load_ui_state_safely();
+                                        next.notice = Some(format!(
+                                            "Queue run: attempted {}, succeeded {}, failed {}. Remaining pending {}, failed {}.",
+                                            summary.attempted,
+                                            summary.succeeded,
+                                            summary.failed,
+                                            summary.remaining_pending,
+                                            summary.remaining_failed,
+                                        ));
+                                        ui_state_signal.set(next);
+                                    }
+                                    Err(error) => {
+                                        let mut next = ui_state_signal();
+                                        next.notice = Some(format!(
+                                            "Queue run failed: {}",
+                                            format_error_with_log("process_queue", &error)
+                                        ));
+                                        ui_state_signal.set(next);
+                                    }
+                                }
+                            });
+                        },
+                        "Process Queue"
+                    }
                 }
             }
 
@@ -617,12 +705,21 @@ fn App() -> Element {
                         }
                     },
                     h2 { "Unmapped issues assigned to me" }
-                    if unmapped.is_empty() {
+                    if unmapped_issues_list.is_empty() {
                         p { class: "drop-hint", "No unmapped issues. Drop a card here to remove personal column mapping." }
                     }
                     div { class: "list",
-                        for issue in unmapped {
-                            {render_issue_card(issue, dragging_issue)}
+                        for issue in unmapped_issues_list.clone() {
+                            {
+                                let sync_state = snapshot.issue_sync_states.get(&issue.issue_key).copied();
+                                render_unmapped_issue_card(
+                                    issue,
+                                    sync_state,
+                                    default_column_id,
+                                    map_dialog,
+                                    ui_state,
+                                )
+                            }
                         }
                     }
                 }
@@ -756,7 +853,10 @@ fn App() -> Element {
                                             p { class: "drop-hint", "Drop issues here" }
                                         }
                                         for issue in column_issues {
-                                            {render_issue_card(issue, dragging_issue)}
+                                            {
+                                                let sync_state = snapshot.issue_sync_states.get(&issue.issue_key).copied();
+                                                render_issue_card(issue, sync_state, dragging_issue)
+                                            }
                                         }
                                     }
                                 }
@@ -765,6 +865,81 @@ fn App() -> Element {
                     }
                 }
             }
+        }
+
+        {
+            map_dialog_snapshot.map(|dialog| {
+                let issue_summary = snapshot
+                    .issues
+                    .iter()
+                    .find(|issue| issue.issue_key == dialog.issue_key)
+                    .map(|issue| issue.summary.clone())
+                    .unwrap_or_else(|| "Issue".to_string());
+
+                rsx! {
+                    div { class: "modal-backdrop",
+                        div { class: "modal",
+                            h3 { "Set Kanban Status" }
+                            p { "{dialog.issue_key} - {issue_summary}" }
+                            label { class: "label", "Kanban column" }
+                            select {
+                                class: "select",
+                                value: "{dialog.selected_column_id}",
+                                onchange: move |event| {
+                                    if let Ok(column_id) = event.value().parse::<i64>() {
+                                        if let Some(mut current) = map_dialog() {
+                                            current.selected_column_id = column_id;
+                                            map_dialog.set(Some(current));
+                                        }
+                                    }
+                                },
+                                for column in snapshot.columns.clone() {
+                                    option {
+                                        key: "{column.id}",
+                                        value: "{column.id}",
+                                        "{column.name}"
+                                    }
+                                }
+                            }
+                            div { class: "modal-actions",
+                                button {
+                                    class: "button secondary",
+                                    onclick: move |_| map_dialog.set(None),
+                                    "Cancel"
+                                }
+                                button {
+                                    class: "button",
+                                    onclick: move |_| {
+                                        let Some(current) = map_dialog() else {
+                                            return;
+                                        };
+
+                                        let rank = next_rank_for_column(&ui_state(), current.selected_column_id);
+                                        let move_result = AppStorage::open().and_then(|storage| {
+                                            storage.move_issue(&current.issue_key, current.selected_column_id, rank)
+                                        });
+
+                                        match move_result {
+                                            Ok(()) => {
+                                                let mut next = load_ui_state_safely();
+                                                next.notice = Some("Issue moved to your Kanban column.".to_string());
+                                                ui_state.set(next);
+                                                map_dialog.set(None);
+                                            }
+                                            Err(error) => {
+                                                let mut next = ui_state();
+                                                next.notice = Some(format!("Could not move issue: {error}"));
+                                                ui_state.set(next);
+                                            }
+                                        }
+                                    },
+                                    "Move Issue"
+                                }
+                            }
+                        }
+                    }
+                }
+            })
         }
 
         {
@@ -887,9 +1062,19 @@ fn App() -> Element {
     }
 }
 
-fn render_issue_card(issue: IssueSnapshot, mut dragging_issue: Signal<Option<String>>) -> Element {
+fn render_issue_card(
+    issue: IssueSnapshot,
+    sync_state: Option<IssueSyncState>,
+    mut dragging_issue: Signal<Option<String>>,
+) -> Element {
     let issue_key = issue.issue_key.clone();
     let issue_key_for_drag = issue_key.clone();
+    let sync_badge = match sync_state {
+        Some(IssueSyncState::Pending) => Some(("sync-chip pending", "Sync pending")),
+        Some(IssueSyncState::Failed) => Some(("sync-chip failed", "Sync failed")),
+        None => None,
+    };
+
     rsx! {
         article {
             key: "{issue_key}",
@@ -898,7 +1083,55 @@ fn render_issue_card(issue: IssueSnapshot, mut dragging_issue: Signal<Option<Str
             ondragstart: move |_| dragging_issue.set(Some(issue_key_for_drag.clone())),
             ondragend: move |_| dragging_issue.set(None),
             div { class: "issue-header",
-                span { class: "issue-key", "{issue.issue_key}" }
+                div {
+                    style: "display:flex; gap:8px; align-items:center;",
+                    span { class: "issue-key", "{issue.issue_key}" }
+                    {sync_badge.map(|(class_name, text)| rsx! { span { class: class_name, "{text}" } })}
+                }
+                span { class: "status-chip", "{issue.jira_status}" }
+            }
+            strong { "{issue.summary}" }
+        }
+    }
+}
+
+fn render_unmapped_issue_card(
+    issue: IssueSnapshot,
+    sync_state: Option<IssueSyncState>,
+    default_column_id: Option<i64>,
+    mut map_dialog: Signal<Option<MapDialogState>>,
+    mut ui_state: Signal<UiState>,
+) -> Element {
+    let issue_key = issue.issue_key.clone();
+    let issue_key_for_click = issue_key.clone();
+    let sync_badge = match sync_state {
+        Some(IssueSyncState::Pending) => Some(("sync-chip pending", "Sync pending")),
+        Some(IssueSyncState::Failed) => Some(("sync-chip failed", "Sync failed")),
+        None => None,
+    };
+
+    rsx! {
+        article {
+            key: "{issue_key}",
+            class: "issue-card selectable",
+            onclick: move |_| {
+                if let Some(column_id) = default_column_id {
+                    map_dialog.set(Some(MapDialogState {
+                        issue_key: issue_key_for_click.clone(),
+                        selected_column_id: column_id,
+                    }));
+                } else {
+                    let mut next = ui_state();
+                    next.notice = Some("Create at least one Kanban column first.".to_string());
+                    ui_state.set(next);
+                }
+            },
+            div { class: "issue-header",
+                div {
+                    style: "display:flex; gap:8px; align-items:center;",
+                    span { class: "issue-key", "{issue.issue_key}" }
+                    {sync_badge.map(|(class_name, text)| rsx! { span { class: class_name, "{text}" } })}
+                }
                 span { class: "status-chip", "{issue.jira_status}" }
             }
             strong { "{issue.summary}" }
@@ -1023,17 +1256,55 @@ fn load_ui_state() -> anyhow::Result<UiState> {
     let outbox_pending_count = persisted
         .outbox_actions
         .iter()
-        .filter(|action| action.state == "pending")
+        .filter(|action| action.state == "pending" || action.state == "processing")
         .count();
+
+    let outbox_failed_count = persisted
+        .outbox_actions
+        .iter()
+        .filter(|action| action.state == "failed")
+        .count();
+
+    let issue_sync_states = derive_issue_sync_states(&persisted.outbox_actions);
 
     Ok(UiState {
         issues: persisted.issues,
         columns: persisted.columns,
         placements,
         outbox_pending_count,
+        outbox_failed_count,
+        issue_sync_states,
         jira_settings,
         jira_token_saved,
         notice: None,
         load_error: None,
     })
+}
+
+fn derive_issue_sync_states(
+    outbox_actions: &[crate::models::OutboxAction],
+) -> HashMap<String, IssueSyncState> {
+    let mut states = HashMap::new();
+
+    for action in outbox_actions {
+        let candidate = match action.state.as_str() {
+            "pending" | "processing" => Some(IssueSyncState::Pending),
+            "failed" => Some(IssueSyncState::Failed),
+            _ => None,
+        };
+
+        let Some(candidate) = candidate else {
+            continue;
+        };
+
+        let entry = states
+            .entry(action.issue_key.clone())
+            .or_insert(IssueSyncState::Failed);
+
+        if *entry != IssueSyncState::Pending {
+            *entry = candidate;
+        }
+    }
+
+    states
 }

@@ -155,6 +155,46 @@ impl JiraClient {
             .collect())
     }
 
+    pub async fn transition_issue(&self, issue_key: &str, transition_id: &str) -> Result<()> {
+        let request = TransitionIssueRequest {
+            transition: TransitionRef {
+                id: transition_id.to_string(),
+            },
+        };
+
+        self.execute_no_content(
+            self.http
+                .post(
+                    self.credentials
+                        .endpoint(&format!("/issue/{issue_key}/transitions")),
+                )
+                .basic_auth(&self.credentials.email, Some(&self.credentials.api_token))
+                .header(ACCEPT, "application/json")
+                .json(&request),
+            &format!("/issue/{issue_key}/transitions"),
+        )
+        .await
+    }
+
+    pub async fn add_comment(&self, issue_key: &str, comment: &str) -> Result<()> {
+        let request = AddCommentRequest {
+            body: CommentDocument::from_text(comment),
+        };
+
+        self.execute_no_content(
+            self.http
+                .post(
+                    self.credentials
+                        .endpoint(&format!("/issue/{issue_key}/comment")),
+                )
+                .basic_auth(&self.credentials.email, Some(&self.credentials.api_token))
+                .header(ACCEPT, "application/json")
+                .json(&request),
+            &format!("/issue/{issue_key}/comment"),
+        )
+        .await
+    }
+
     async fn execute_json<T: DeserializeOwned>(
         &self,
         request: reqwest::RequestBuilder,
@@ -182,6 +222,32 @@ impl JiraClient {
             .json::<T>()
             .await
             .with_context(|| format!("failed to parse jira {operation} response"))
+    }
+
+    async fn execute_no_content(
+        &self,
+        request: reqwest::RequestBuilder,
+        operation: &str,
+    ) -> Result<()> {
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("failed to reach jira {operation} endpoint"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unable to read response body>".to_string());
+            return Err(anyhow!(
+                "jira {operation} request failed (HTTP {}): {}",
+                status.as_u16(),
+                compact_error_body(&body)
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -235,6 +301,59 @@ struct SearchIssueStatus {
 struct SearchIssueAssignee {
     #[serde(rename = "displayName")]
     display_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TransitionIssueRequest {
+    transition: TransitionRef,
+}
+
+#[derive(Debug, Serialize)]
+struct TransitionRef {
+    id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AddCommentRequest {
+    body: CommentDocument,
+}
+
+#[derive(Debug, Serialize)]
+struct CommentDocument {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    version: u8,
+    content: Vec<CommentParagraph>,
+}
+
+impl CommentDocument {
+    fn from_text(text: &str) -> Self {
+        Self {
+            kind: "doc",
+            version: 1,
+            content: vec![CommentParagraph {
+                kind: "paragraph",
+                content: vec![CommentText {
+                    kind: "text",
+                    text: text.to_string(),
+                }],
+            }],
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CommentParagraph {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    content: Vec<CommentText>,
+}
+
+#[derive(Debug, Serialize)]
+struct CommentText {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: String,
 }
 
 #[derive(Debug, Deserialize)]

@@ -21,6 +21,7 @@ cargo run
 3. Paste an API token (stored locally in SQLite settings on save/test/sync).
 4. Optional: adjust the JQL used for assigned issue sync.
 5. Click `Test Connection`, then `Sync Now`.
+6. After moving cards with optional Jira actions, click `Process Queue` to execute queued transitions/comments.
 
 ## Logs
 
@@ -38,11 +39,12 @@ cargo run
 - Local-first behavior is implemented.
 - Manual Jira pull sync is wired (`myself` + `search/jql` for assigned issues).
 - Drop modal now loads live Jira transitions per issue.
-- Optional transition/comment are queued in `outbox_actions` (transition id + name) for future sync worker.
+- Optional transition/comment are queued in `outbox_actions` (transition id + name).
+- Manual queue processor executes pending/failed Jira updates and reports results.
 
 ## Next milestone
 
-1. Process `outbox_actions` in a background worker and mark success/failure.
-2. Add retry/backoff policy and sync status badges on cards.
+1. Add automatic background queue processing with retry/backoff policy.
+2. Add richer sync status badges and per-action retry controls in UI.
 3. Add column/card reordering polish and conflict indicators.
 4. Add stale issue handling and auto-refresh interval.

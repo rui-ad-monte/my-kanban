@@ -25,10 +25,12 @@ Implemented:
 - Manual assigned-issue sync via Jira `/search/jql` with local upsert
 - Drop modal transition options fetched live from Jira per issue
 - Outbox queue stores transition id + name for future worker execution
+- Manual queue processor executes pending/failed outbox actions
+- Card-level sync badges for pending/failed Jira actions
 
 Not implemented yet:
 
-- Background outbox processor and retry policy
+- Automatic background outbox processor and retry policy
 - Conflict/sync status indicators in UI
 
 ## Execution Plan
@@ -105,8 +107,8 @@ Done when:
 
 ## Prioritized Next Steps (Immediate)
 
-1. Implement first outbox processor with manual retry button.
-2. Add retry/backoff policy and card-level sync status badges.
+1. Add automatic queue processing with retry/backoff policy.
+2. Add explicit per-action retry controls in UI.
 3. Add stale issue handling (no longer assigned / moved to done).
 4. Add auto-refresh interval for incoming assigned-issue sync.
 5. Add conflict indicators for local-vs-jira status mismatches.
