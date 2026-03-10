@@ -1,0 +1,11 @@
+[package]
+name = "personal-jira-kanban"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["clock"] }
+directories = "5.0"
+dioxus = { version = "0.7.2", features = ["desktop"] }
+rusqlite = { version = "0.31", features = ["bundled"] }

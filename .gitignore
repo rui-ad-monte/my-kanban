@@ -1,0 +1,5 @@
+/target
+/tmp
+
+# Local desktop app data (if created under repo during tests)
+/.local-data

@@ -1,0 +1,128 @@
+# Personal Jira Layer - Build Plan and Follow-up Steps
+
+## Goal
+
+Build a desktop app (Dioxus) that keeps Jira as the issue source of truth while adding a personal workflow layer with:
+
+- `Unmapped Issues` (assigned to me, not mapped to a personal column)
+- `My Kanban` (unlimited custom columns + drag/drop)
+- Optional Jira transition and optional comment when moving a card
+- Local persistence for personal status and queued Jira updates
+
+## Current Status
+
+Implemented:
+
+- Dioxus desktop app shell with `Unmapped Issues` and `My Kanban`
+- Custom column creation
+- Drag/drop between columns
+- Drop modal with optional transition and comment
+- SQLite local persistence (`jira_issue_snapshot`, `board_columns`, `issue_placements`, `outbox_actions`)
+- Local queue for future Jira sync worker
+- Seed data for first run
+
+Not implemented yet:
+
+- Jira authentication and API integration
+- Live transition list from Jira per issue
+- Background outbox processor and retry policy
+- Conflict/sync status indicators in UI
+
+## Execution Plan
+
+### Phase 1 - Jira Connectivity and Settings
+
+1. Add settings UI for:
+   - Jira base URL
+   - Jira email
+   - Jira API token
+2. Store secrets securely (system keychain), not plain SQLite.
+3. Add `jira_client` module with typed API functions:
+   - `myself`
+   - `search_assigned_issues`
+   - `get_transitions`
+   - `transition_issue`
+   - `add_comment`
+4. Validate credentials with a connection test action.
+
+Done when:
+
+- User can configure Jira credentials once.
+- App successfully fetches current user identity from Jira.
+
+### Phase 2 - Incoming Sync (Assigned Issues)
+
+1. Add sync command (`Sync now`) plus auto-refresh interval.
+2. Query Jira with JQL for assigned active issues.
+3. Upsert issue snapshots locally.
+4. Preserve personal placement (do not override `issue_placements`).
+5. Handle removed issues (no longer assigned, moved to done, etc.) with local visibility flags.
+
+Done when:
+
+- `Unmapped Issues` and `My Kanban` are backed by real Jira data.
+- Sync updates issue summaries/statuses without losing personal column mapping.
+
+### Phase 3 - Drop Modal with Real Jira Transitions
+
+1. Replace static transition options with Jira transitions fetched for selected issue.
+2. Keep transition/comment optional.
+3. Save local move first, then queue Jira action in outbox.
+4. Add clear user feedback for queued action creation.
+
+Done when:
+
+- Modal shows valid transition options from Jira for that issue.
+- Move always persists locally even if server update is skipped.
+
+### Phase 4 - Outbox Worker and Reliability
+
+1. Add background worker for `outbox_actions` processing.
+2. Process transition first, then comment (when both exist).
+3. Retry failed actions with exponential backoff.
+4. Save error details and expose retry action in UI.
+5. Add online/offline resilient behavior.
+
+Done when:
+
+- Queued updates eventually sync to Jira.
+- Failures are visible and retryable.
+
+### Phase 5 - UX and Board Management
+
+1. Add column rename/delete/reorder.
+2. Add within-column reordering of cards.
+3. Add filters/search (issue key, summary, status).
+4. Add sync health badges (pending, failed, synced).
+5. Improve empty/loading/error states.
+
+Done when:
+
+- Daily use is smooth and transparent for sync outcomes.
+
+## Prioritized Next Steps (Immediate)
+
+1. Create `jira_client` module with auth + `myself` endpoint.
+2. Add settings screen for Jira credentials.
+3. Implement `Sync now` to populate local snapshots.
+4. Wire drop modal to fetch transitions dynamically from Jira.
+5. Implement first outbox processor with manual retry button.
+
+## Suggested Technical Structure
+
+- `src/main.rs`: UI composition and routing/views
+- `src/storage.rs`: SQLite repositories and migrations/bootstrap
+- `src/models.rs`: local domain models
+- `src/jira_client.rs`: Jira REST integration and DTOs
+- `src/sync.rs`: pull sync + outbox processing orchestration
+- `src/settings.rs`: secure settings/keychain helpers
+
+## Acceptance Criteria (MVP)
+
+- User connects Jira account from app settings.
+- App syncs assigned issues and displays them.
+- User creates custom columns and drags cards.
+- On drop, user can optionally pick Jira transition and comment.
+- Local move is always saved.
+- Optional Jira actions are queued and processed with retry.
+- Sync failures are visible and recoverable.
